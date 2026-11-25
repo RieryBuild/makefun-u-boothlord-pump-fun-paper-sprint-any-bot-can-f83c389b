@@ -1,362 +1,331 @@
-// Pump.fun Paper Sprint — selective early-strength paper trader.
+// Broad-buyer paper trader for make.fun's "Pump.fun Paper Sprint: Any Bot
+// Can Win" (pumpfun-replay/v2). Node 22, zero imports: the NDJSON transport
+// is hand-rolled from protocol.schema.json, and every decision is a pure
+// function of the batches seen so far, so two runs produce byte-identical
+// action logs. No wall clock, no randomness.
 //
-// Own strategy, written from the agent-fun/replay/v2 protocol spec and a
-// read of the kit's dev dataset (no baseline or pilot code was used).
-//
-// v2 — buyer-breadth filter (the v1 lesson, measured, not guessed):
-//   * v1 (buy every coin whose real SOL crossed 5) graded -1.73 SOL on dev:
-//     the 2-slot fill latency means a momentum entry buys AFTER the burst
-//     spike, at the top; mean reversion then hits the stop. A latency-free
-//     sim flips from +7.6% to -0.4% mean return when entry is delayed 2 slots.
-//   * What survives latency is BREADTH: coins with >=45 distinct buyers and
-//     >=65% buy share by the time real reserves cross 5 SOL, still gaining
-//     >=10 new buyers in the last 300 slots, win 40.5% of round trips at
-//     +20%/-10% exits (dev sim -0.067 SOL over 121 trips, max DD 2.1%,
-//     24-37 trips in every 6h quarter of the dev window — safely above the
-//     >=20 guardrail, unlike the >=50-buyer shape at 13-23 trips/quarter).
-//   * Fees are the enemy: a round trip costs ~1.25% of size per side plus a
-//     flat 105,000 lamports per order, so a trade must clear roughly 3% of
-//     price movement just to break even. One trade per coin, fixed +20%
-//     take-profit / -10% stop-loss / 2400-slot timeout, max 5 open, max 2
-//     buys per batch keeps the fill count low and the book spread across
-//     many coins, which is what the >=20 distinct-mint guardrail wants.
-//
-// Transport is hand-rolled here from protocol.schema.json: newline-delimited
-// JSON on stdin (hello, batch..., done), one reply per batch on stdout
-// echoing the batch seq. Node 22 stdlib only, no dependencies.
-//
-// Determinism: no clock, no environment, no unseeded randomness. Every
-// decision is a pure function of the hello seed and the messages seen so
-// far; candidate order is fully specified (distinct buyers desc, mint asc),
-// so two runs produce byte-identical action logs.
+// Strategy (measured on the dev window with a slot-faithful replay):
+//   - Buy a coin once when it proves broad, fresh demand: real SOL >= 5,
+//     price >= +2% vs its create price, >= 50 distinct buyers, buys >= 60%
+//     of its trades, and >= 10 first-time buyers in the last 300 slots.
+//   - Size: min(0.06 SOL, 95% of the 1%-of-real-reserve order cap), at
+//     least 0.012 SOL (the guardrail's round-trip floor).
+//   - Exit: take profit +20%, stop loss -12%, or a 2400-slot timeout,
+//     whichever comes first; always sell the whole position.
+//   - Pace insurance: the final window is one 6h stretch and the guardrail
+//     needs >= 20 distinct mints, so the buyer gate relaxes (50 -> 45 ->
+//     40 -> 35) when the trip rate falls behind 25 per ~100,800 slots.
+//     On a normal window it never triggers.
+//   - At most 2 buys per batch, at most 5 open positions (the harness cap),
+//     one trade per coin, never a sell the position cannot cover.
 
-const LAMPORTS_PER_SOL = 1_000_000_000n;
+type MintState = {
+  createVq: bigint;
+  createVt: bigint;
+  lastVq: bigint;
+  lastVt: bigint;
+  lastRq: bigint;
+  lastRt: bigint;
+  buyers: Set<string>;
+  firstBuySlot: Map<string, number>;
+  buyTrades: number;
+  trades: number;
+  complete: boolean;
+};
+
+type EntryInfo = { paid: bigint; tokens: bigint; fillSlot: number };
+
+// ---- strategy parameters (all in lamports / slots / counts) ----
+const MIN_REAL_SOL_LAMPORTS = 5_000_000_000n;
+const MIN_GAIN_NUM = 102n; // price >= +2% vs create
+const MIN_BUYERS = 50;
+const MIN_BUY_SHARE_PCT = 60;
+const MIN_RECENT_BUYERS = 10;
+const RECENT_WINDOW_SLOTS = 300;
+const STAKE_LAMPORTS = 60_000_000n;
+const CAP_FRAC_NUM = 95n;
+const CAP_FRAC_DEN = 100n;
+const MIN_BUY_LAMPORTS = 12_000_000n;
+const TP_NUM = 120n; // take profit +20%
+const SL_NUM = 88n; // stop loss -12%
+const TIMEOUT_SLOTS = 2400;
+const MAX_BUYS_PER_BATCH = 2;
+const MAX_SLIPPAGE_BPS = 10_000;
+
+// Pace insurance: target 25 trips per PACE_SLOTS slots (~6h), slack 3,
+// then relax the buyer gate one step per 2 trips of deficit.
+const PACE_TARGET_TRIPS = 25;
+const PACE_SLOTS = 100_800;
+const PACE_SLACK = 3;
+const PACE_STEP_SIZE = 2;
+const PACE_STEPS: { buyers: number; share: number }[] = [
+  { buyers: 45, share: 60 },
+  { buyers: 40, share: 60 },
+  { buyers: 35, share: 60 },
+];
+
 const BPS = 10_000n;
 
-// --- strategy parameters (all in one place, tuned on the dev window) ---
-const REAL_SOL_ENTRY_MIN = 5n * LAMPORTS_PER_SOL; // real reserves must reach 5 SOL
-const BUY_TARGET_LAMPORTS = 60_000_000n; // 0.06 SOL per coin, when the cap allows
-const BUY_MIN_LAMPORTS = 12_000_000n; // 0.012 SOL: safely above the 0.01 SOL round-trip bar
-const BUY_CAP_USE_BPS = 9500n; // use at most 95% of the per-batch order cap
-const PRICE_VS_CREATE_MIN_BPS = 200; // price must be >= +2% vs the create price
-const MIN_BUYERS = 45; // distinct buyers before entry (breadth = quality)
-const MIN_BUY_SHARE_BPS = 6500; // buys must be >= 65% of the coin's trades
-const ACCEL_BUYERS = 10; // >= 10 NEW distinct buyers in the last ACCEL_SLOTS
-const ACCEL_SLOTS = 300;
-const TAKE_PROFIT_BPS = 2000; // +20% vs all-in cost per token
-const STOP_LOSS_BPS = 1000; // -10% vs all-in cost per token
-const MAX_HOLD_SLOTS = 2400; // ~10 min of slots; frees a stuck position
-const MAX_SLIPPAGE_BPS = 500; // 5% slippage allowance on every order
-const MAX_BUYS_PER_BATCH = 2; // never flood one batch with entries
-
-type Mint = string;
-
-interface CurveInfo {
-  createPrice: number; // virtual SOL per token at creation (float ratio)
-  createSlot: number;
-  price: number; // latest virtual SOL per token
-  realSol: bigint; // latest real SOL reserves (lamports)
-  trades: number;
-  buys: number; // buy trades seen (for the buy-share filter)
-  buyers: Set<string>; // distinct buyer wallets (breadth filter)
-  buyerHist: [number, number][]; // [slot, distinct buyers] per trade, capped
-  complete: boolean;
+// price(cur) >= price(base) * num/den, exact in BigInt. A price is a
+// (vq, vt) pair: lamports per token = vq / vt.
+function priceGe(
+  cur: { vq: bigint; vt: bigint },
+  base: { vq: bigint; vt: bigint },
+  num: bigint,
+  den: bigint,
+): boolean {
+  return cur.vq * base.vt * den >= base.vq * cur.vt * num;
 }
 
-interface OpenPosition {
-  tokens: bigint;
-  costPerToken: number; // all-in lamports per token, from the buy fill
-  entrySlot: number; // slot the buy fill resolved at
-}
-
-interface PendingBuy {
-  mint: Mint;
-  sizeLamports: bigint;
-}
-
-const curves = new Map<Mint, CurveInfo>();
-const positions = new Map<Mint, OpenPosition>();
-const traded = new Set<Mint>(); // mints we have already bought (one trade per coin)
-const pendingBuys = new Map<string, PendingBuy>(); // client_id -> mint
-const pendingSells = new Set<Mint>();
-let orderCounter = 0;
-let maxOpenPositions = 5;
-let maxOrderBps = 100;
+// ---- runtime state ----
+const mints = new Map<string, MintState>();
+const hot = new Set<string>(); // mints passing the static gates
+const traded = new Set<string>(); // mints ever bought (one trade per coin)
+const pendingBuy = new Map<string, bigint>(); // mint -> quote in flight
+const pendingSell = new Set<string>();
+const entries = new Map<string, EntryInfo>(); // mint -> open position entry
+let maxOpen = 5;
 let maxOrdersPerBatch = 16;
+let maxOrderBps = 100n;
 let txFeeLamports = 105_000n;
-let cashLamports = 0n;
-let helloSeed = '0';
+let firstSlot: number | null = null;
+let tripsOpened = 0;
+let orderCounter = 0;
 
-function nextClientId(prefix: string): string {
-  orderCounter += 1;
-  return `${prefix}${orderCounter}`;
+function loosestBuyers(): number {
+  let lo = MIN_BUYERS;
+  for (const s of PACE_STEPS) if (s.buyers < lo) lo = s.buyers;
+  return lo;
 }
 
-// Current mark price of a mint: virtual quote reserves / virtual token reserves.
-function priceOf(vQuote: bigint, vToken: bigint): number {
-  if (vToken === 0n) return 0;
-  return Number(vQuote) / Number(vToken);
+function paceGate(slot: number): { buyers: number; share: number } {
+  const base = { buyers: MIN_BUYERS, share: MIN_BUY_SHARE_PCT };
+  if (firstSlot === null) return base;
+  const elapsed = Math.max(1, slot - firstSlot);
+  const expected = (elapsed / PACE_SLOTS) * PACE_TARGET_TRIPS;
+  const behind = expected - tripsOpened;
+  if (behind <= PACE_SLACK) return base;
+  const idx = Math.min(
+    PACE_STEPS.length - 1,
+    Math.floor((behind - PACE_SLACK) / PACE_STEP_SIZE),
+  );
+  return PACE_STEPS[idx]!;
 }
 
-function maxBuyLamports(mint: Mint): bigint {
-  const c = curves.get(mint);
-  if (c === undefined || c.complete) return 0n;
-  return (c.realSol * BigInt(maxOrderBps)) / BPS;
+// Refresh one mint's hot-set membership after its own trade/complete event.
+// Every gate here moves only on the mint's own trades, so a mint can only
+// enter or leave the set on one of its own batches.
+function refreshHot(mint: string): void {
+  const s = mints.get(mint);
+  if (!s || s.complete || traded.has(mint)) {
+    hot.delete(mint);
+    return;
+  }
+  const gainOk = priceGe(
+    { vq: s.lastVq, vt: s.lastVt },
+    { vq: s.createVq, vt: s.createVt },
+    MIN_GAIN_NUM,
+    100n,
+  );
+  const sharePct = s.trades ? (s.buyTrades / s.trades) * 100 : 0;
+  const ok =
+    s.lastRq >= MIN_REAL_SOL_LAMPORTS &&
+    gainOk &&
+    s.buyers.size >= loosestBuyers() &&
+    sharePct >= MIN_BUY_SHARE_PCT;
+  if (ok) hot.add(mint);
+  else hot.delete(mint);
 }
 
-function handleHello(msg: any): void {
-  helloSeed = String(msg.seed ?? '0');
-  cashLamports = BigInt(msg.capital.lamports);
-  maxOpenPositions = Number(msg.caps.max_open_positions);
-  maxOrderBps = Number(msg.caps.max_order_bps_of_real_reserve);
-  maxOrdersPerBatch = Number(msg.caps.max_orders_per_batch);
-  txFeeLamports =
-    BigInt(msg.fees.base_fee_lamports) + BigInt(msg.fees.priority_fee_lamports);
-  // helloSeed is the run's only sanctioned randomness source; this strategy
-  // is fully deterministic without randomness, so the seed is only recorded.
-  void helloSeed;
+function recentBuyers(s: MintState, slot: number): number {
+  let n = 0;
+  for (const fs of s.firstBuySlot.values()) if (fs > slot - RECENT_WINDOW_SLOTS) n++;
+  return n;
+}
+
+function observeEvent(e: any, slot: number): void {
+  const mint: string = e.mint;
+  if (e.event === 'CreateEvent') {
+    if (!mints.has(mint)) {
+      mints.set(mint, {
+        createVq: BigInt(e.virtual_quote_reserves),
+        createVt: BigInt(e.virtual_token_reserves),
+        lastVq: BigInt(e.virtual_quote_reserves),
+        lastVt: BigInt(e.virtual_token_reserves),
+        lastRq: 0n,
+        lastRt: BigInt(e.real_token_reserves),
+        buyers: new Set(),
+        firstBuySlot: new Map(),
+        buyTrades: 0,
+        trades: 0,
+        complete: false,
+      });
+    }
+    return;
+  }
+  const s = mints.get(mint);
+  if (!s) return;
+  if (e.event === 'TradeEvent') {
+    s.trades++;
+    s.lastVq = BigInt(e.virtual_quote_reserves);
+    s.lastVt = BigInt(e.virtual_token_reserves);
+    s.lastRq = BigInt(e.real_quote_reserves);
+    s.lastRt = BigInt(e.real_token_reserves);
+    if (e.is_buy) {
+      s.buyTrades++;
+      s.buyers.add(e.user);
+      if (!s.firstBuySlot.has(e.user)) s.firstBuySlot.set(e.user, slot);
+    }
+    refreshHot(mint);
+  } else if (e.event === 'CompleteEvent') {
+    s.complete = true;
+    refreshHot(mint);
+  }
 }
 
 function handleFills(fills: any[]): void {
-  for (const f of fills ?? []) {
-    const mint: Mint = f.mint;
-    if (f.status === 'filled' && f.side === 'buy') {
-      const tokens = BigInt(f.token_amount);
-      const quote = BigInt(f.quote_lamports);
-      if (tokens > 0n) {
-        positions.set(mint, {
-          tokens,
-          costPerToken: Number(quote) / Number(tokens),
-          entrySlot: Number(f.slot),
+  for (const f of fills) {
+    const mint: string = f.mint;
+    if (typeof f.client_id === 'string' && f.client_id.startsWith('_')) {
+      // Harness close (complete / flatten / writeoff): the position is gone.
+      entries.delete(mint);
+      pendingSell.delete(mint);
+      continue;
+    }
+    if (f.side === 'buy') {
+      pendingBuy.delete(mint);
+      if (f.status === 'filled') {
+        entries.set(mint, {
+          paid: BigInt(f.quote_lamports),
+          tokens: BigInt(f.token_amount),
+          fillSlot: f.slot,
         });
-        traded.add(mint);
+        tripsOpened++;
       }
-      pendingBuys.delete(f.client_id);
-    } else if (f.status === 'filled' && f.side === 'sell') {
-      positions.delete(mint);
-      pendingSells.delete(mint);
-    } else if (f.status === 'rejected' || f.status === 'failed') {
-      // A rejected/failed buy frees the mint for a later retry only if it
-      // never filled; a failed sell leaves the position open for retry.
-      if (f.side === 'buy') pendingBuys.delete(f.client_id);
-      if (f.side === 'sell') pendingSells.delete(mint);
+    } else {
+      pendingSell.delete(mint);
+      if (f.status === 'filled') entries.delete(mint);
     }
   }
 }
 
-function syncAccount(account: any): void {
-  cashLamports = BigInt(account.cash_lamports);
-  const live = new Set<Mint>();
-  for (const p of account.positions ?? []) {
-    const tokens = BigInt(p.token_amount);
-    if (tokens <= 0n) continue;
-    live.add(p.mint);
-    const known = positions.get(p.mint);
-    if (known !== undefined) {
-      known.tokens = tokens; // partial sells shrink the holding
-    } else if (!traded.has(p.mint)) {
-      // A position we do not recognise (should not happen): track it at
-      // its reported cost so exits still work.
-      positions.set(p.mint, {
-        tokens,
-        costPerToken: Number(BigInt(p.cost_lamports)) / Number(tokens),
-        entrySlot: 0,
-      });
-    }
-  }
-  // Harness closes (curve complete / replay end) drop positions silently.
-  for (const mint of [...positions.keys()]) {
-    if (!live.has(mint)) positions.delete(mint);
-  }
-}
+function decideBatch(batch: any): any[] {
+  const slot: number = batch.slot;
+  if (firstSlot === null) firstSlot = slot;
+  for (const e of batch.events) observeEvent(e, slot);
+  handleFills(batch.fills ?? []);
 
-function handleMarks(marks: any[]): void {
-  for (const m of marks ?? []) {
-    const c = curves.get(m.mint);
-    if (c === undefined) continue;
-    c.price = priceOf(BigInt(m.virtual_quote_reserves), BigInt(m.virtual_token_reserves));
-    c.realSol = BigInt(m.real_quote_reserves);
-  }
-}
-
-function handleEvents(events: any[]): void {
-  for (const e of events ?? []) {
-    if (e.event === 'CreateEvent') {
-      if (!curves.has(e.mint)) {
-        curves.set(e.mint, {
-          createPrice: priceOf(
-            BigInt(e.virtual_sol_reserves),
-            BigInt(e.virtual_token_reserves),
-          ),
-          createSlot: Number(e.slot),
-          price: priceOf(BigInt(e.virtual_sol_reserves), BigInt(e.virtual_token_reserves)),
-          realSol: 0n,
-          trades: 0,
-          buys: 0,
-          buyers: new Set(),
-          buyerHist: [],
-          complete: false,
-        });
-      }
-    } else if (e.event === 'TradeEvent') {
-      let c = curves.get(e.mint);
-      if (c === undefined) {
-        c = {
-          createPrice: priceOf(BigInt(e.virtual_sol_reserves), BigInt(e.virtual_token_reserves)),
-          createSlot: Number(e.slot),
-          price: 0,
-          realSol: 0n,
-          trades: 0,
-          buys: 0,
-          buyers: new Set(),
-          buyerHist: [],
-          complete: false,
-        };
-        curves.set(e.mint, c);
-      }
-      c.price = priceOf(BigInt(e.virtual_sol_reserves), BigInt(e.virtual_token_reserves));
-      c.realSol = BigInt(e.real_sol_reserves);
-      c.trades += 1;
-      if (e.is_buy) c.buys += 1;
-      if (typeof e.user === 'string') c.buyers.add(e.user);
-      c.buyerHist.push([Number(e.slot), c.buyers.size]);
-      if (c.buyerHist.length > 500) c.buyerHist.splice(0, c.buyerHist.length - 500);
-    } else if (e.event === 'CompleteEvent') {
-      const c = curves.get(e.mint);
-      if (c !== undefined) c.complete = true;
-    }
-  }
-}
-
-function decideOrders(batch: any): any[] {
   const orders: any[] = [];
-  const slot = Number(batch.slot);
+  const account = batch.account;
+  const positions: any[] = account?.positions ?? [];
+  let cash = BigInt(account?.cash_lamports ?? '0');
+  // Cash the bot can still spend: pending buys have not settled yet, so
+  // their quote + tx fees are reserved here (they never bind at 10 SOL
+  // of capital, but the accounting stays honest).
+  for (const q of pendingBuy.values()) cash -= q + txFeeLamports;
 
-  // --- exits first: take-profit, stop-loss, or hold timeout ---
-  for (const [mint, pos] of [...positions.entries()].sort((a, b) =>
-    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
-  )) {
-    if (pendingSells.has(mint)) continue;
-    const c = curves.get(mint);
-    if (c === undefined || c.price <= 0 || pos.costPerToken <= 0) continue;
-    const retBps = Math.floor(((c.price - pos.costPerToken) / pos.costPerToken) * 10000);
-    const held = pos.entrySlot > 0 ? slot - pos.entrySlot : 0;
-    if (retBps >= TAKE_PROFIT_BPS || retBps <= -STOP_LOSS_BPS || held >= MAX_HOLD_SLOTS) {
+  // --- Exits: TP / SL / timeout on held positions. ---
+  for (const p of positions) {
+    const mint: string = p.mint;
+    if (pendingSell.has(mint)) continue;
+    const en = entries.get(mint);
+    const tokens = BigInt(p.token_amount);
+    if (!en || tokens === 0n) continue;
+    const s = mints.get(mint);
+    if (!s) continue;
+    const cur = { vq: s.lastVq, vt: s.lastVt };
+    const base = { vq: en.paid, vt: en.tokens };
+    const tpHit = priceGe(cur, base, TP_NUM, 100n);
+    const slHit = !priceGe(cur, base, SL_NUM, 100n);
+    const timedOut = slot >= en.fillSlot + TIMEOUT_SLOTS;
+    if (tpHit || slHit || timedOut) {
       orders.push({
         side: 'sell',
-        client_id: nextClientId('s'),
+        client_id: `o${orderCounter++}`,
         mint,
-        token_amount: pos.tokens.toString(),
+        token_amount: tokens.toString(),
         max_slippage_bps: MAX_SLIPPAGE_BPS,
       });
-      pendingSells.add(mint);
+      pendingSell.add(mint);
+      cash -= txFeeLamports;
     }
   }
 
-  // --- entries: broad, still-accelerating coins past 5 SOL of real reserves ---
-  const openCount =
-    positions.size + [...pendingBuys.values()].filter((p) => !positions.has(p.mint)).length;
-  let freeSlots = maxOpenPositions - openCount;
-  if (freeSlots > 0) {
-    // Cash reserved for the tx fees AND sizes of orders already in flight:
-    // pending buys have not been deducted from the account cash yet, so
-    // count them here or a low-cash run could over-commit its buys.
-    let freeCash = cashLamports;
-    for (const p of pendingBuys.values()) freeCash -= p.sizeLamports + txFeeLamports;
-    freeCash -= BigInt(orders.length) * txFeeLamports;
-
-    const candidates: { mint: Mint; buyers: number }[] = [];
-    for (const [mint, c] of curves) {
-      if (c.complete || c.trades < 2) continue;
-      if (traded.has(mint) || positions.has(mint)) continue;
-      if ([...pendingBuys.values()].some((p) => p.mint === mint)) continue;
-      if (c.realSol < REAL_SOL_ENTRY_MIN) continue;
-      if (c.createPrice <= 0) continue;
-      // Breadth: many distinct buyers, mostly buying (not a few whales).
-      if (c.buyers.size < MIN_BUYERS) continue;
-      if (c.trades > 0 && (c.buys * 10000) / c.trades < MIN_BUY_SHARE_BPS) continue;
-      // Still accelerating: >= 10 new distinct buyers in the last 300 slots.
-      // A coin younger than that window counts all its buyers so far.
-      let oldBuyers: number | null = null;
-      for (let i = c.buyerHist.length - 1; i >= 0; i--) {
-        if (c.buyerHist[i][0] <= slot - ACCEL_SLOTS) {
-          oldBuyers = c.buyerHist[i][1];
-          break;
-        }
-      }
-      const gained = oldBuyers === null ? c.buyers.size : c.buyers.size - oldBuyers;
-      if (gained < ACCEL_BUYERS) continue;
-      const gainBps = Math.floor(((c.price - c.createPrice) / c.createPrice) * 10000);
-      if (gainBps < PRICE_VS_CREATE_MIN_BPS) continue;
-      candidates.push({ mint, buyers: c.buyers.size });
+  // --- Entries. ---
+  const gate = paceGate(slot);
+  const committed = positions.length + pendingBuy.size;
+  let slotsLeft = maxOpen - committed;
+  let buysLeft = MAX_BUYS_PER_BATCH;
+  if (slotsLeft > 0 && buysLeft > 0) {
+    const cands: { mint: string; buyers: number }[] = [];
+    for (const mint of hot) {
+      if (traded.has(mint) || pendingBuy.has(mint)) continue;
+      if (positions.some((p: any) => p.mint === mint)) continue;
+      const s = mints.get(mint);
+      if (!s || s.complete) continue;
+      const sharePct = s.trades ? (s.buyTrades / s.trades) * 100 : 0;
+      if (s.buyers.size < gate.buyers || sharePct < gate.share) continue;
+      if (recentBuyers(s, slot) < MIN_RECENT_BUYERS) continue;
+      cands.push({ mint, buyers: s.buyers.size });
     }
-    // Deterministic order: broadest coin first, mint as tie-break.
-    candidates.sort((a, b) => {
-      if (a.buyers !== b.buyers) return b.buyers - a.buyers;
-      return a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0;
-    });
-
-    let buys = 0;
-    for (const cand of candidates) {
-      if (freeSlots <= 0 || buys >= MAX_BUYS_PER_BATCH) break;
-      if (orders.length >= maxOrdersPerBatch) break;
-      const cap = maxBuyLamports(cand.mint);
-      let size = BUY_TARGET_LAMPORTS;
-      const capped = (cap * BUY_CAP_USE_BPS) / BPS;
-      if (capped < size) size = capped;
-      if (size < BUY_MIN_LAMPORTS) continue;
-      if (freeCash < size + txFeeLamports) continue;
-      const clientId = nextClientId('b');
+    // Most buyers first; mint string breaks ties (deterministic order).
+    cands.sort((a, b) => b.buyers - a.buyers || (a.mint < b.mint ? -1 : a.mint > b.mint ? 1 : 0));
+    for (const c of cands) {
+      if (slotsLeft <= 0 || buysLeft <= 0 || orders.length >= maxOrdersPerBatch) break;
+      const s = mints.get(c.mint)!;
+      const cap = (s.lastRq * maxOrderBps) / BPS; // 1% of real reserve
+      let amount = (cap * CAP_FRAC_NUM) / CAP_FRAC_DEN;
+      if (amount > STAKE_LAMPORTS) amount = STAKE_LAMPORTS;
+      if (amount < MIN_BUY_LAMPORTS) continue;
+      if (cash < amount + txFeeLamports) continue;
       orders.push({
         side: 'buy',
-        client_id: clientId,
-        mint: cand.mint,
-        quote_lamports: size.toString(),
+        client_id: `o${orderCounter++}`,
+        mint: c.mint,
+        quote_lamports: amount.toString(),
         max_slippage_bps: MAX_SLIPPAGE_BPS,
       });
-      pendingBuys.set(clientId, { mint: cand.mint, sizeLamports: size });
-      freeCash -= size + txFeeLamports;
-      freeSlots -= 1;
-      buys += 1;
+      pendingBuy.set(c.mint, amount);
+      traded.add(c.mint);
+      cash -= amount + txFeeLamports;
+      slotsLeft--;
+      buysLeft--;
     }
   }
-
-  return orders.slice(0, maxOrdersPerBatch);
+  return orders;
 }
 
-async function main(): Promise<void> {
-  let buffer = '';
-  process.stdin.setEncoding('utf8');
-  for await (const chunk of process.stdin) {
-    buffer += chunk;
-    let idx = -1;
-    while ((idx = buffer.indexOf('\n')) !== -1) {
-      const line = buffer.slice(0, idx).trim();
-      buffer = buffer.slice(idx + 1);
-      if (line === '') continue;
-      const msg = JSON.parse(line);
-      if (msg.type === 'hello') {
-        handleHello(msg);
-      } else if (msg.type === 'batch') {
-        // Fills, then account, then marks, then events — the same order
-        // the harness applies them, so our view matches its decisions.
-        handleFills(msg.fills);
-        syncAccount(msg.account);
-        handleMarks(msg.marks);
-        handleEvents(msg.events);
-        const orders = decideOrders(msg);
-        process.stdout.write(
-          JSON.stringify({ type: 'reply', seq: msg.seq, orders }) + '\n',
-        );
-      } else if (msg.type === 'done') {
-        syncAccount(msg.account);
-        return;
-      }
+// ---- NDJSON transport (hand-rolled, no imports) ----
+let buffer = '';
+
+process.stdin.on('data', (chunk: Buffer) => {
+  buffer += chunk.toString('utf8');
+  let idx: number;
+  while ((idx = buffer.indexOf('\n')) >= 0) {
+    const line = buffer.slice(0, idx);
+    buffer = buffer.slice(idx + 1);
+    if (!line) continue;
+    let msg: any;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      continue; // a malformed line must never kill the run; the harness
+      // only ever sends valid JSON, so this is pure insurance.
+    }
+    if (msg.type === 'hello') {
+      maxOpen = msg.caps.max_open_positions;
+      maxOrdersPerBatch = msg.caps.max_orders_per_batch;
+      maxOrderBps = BigInt(msg.caps.max_order_bps_of_real_reserve);
+      txFeeLamports =
+        BigInt(msg.fees.base_fee_lamports) + BigInt(msg.fees.priority_fee_lamports);
+    } else if (msg.type === 'batch') {
+      const orders = decideBatch(msg);
+      process.stdout.write(
+        JSON.stringify({ type: 'reply', seq: msg.seq, orders }) + '\n',
+      );
+    } else if (msg.type === 'done') {
+      process.exit(0);
     }
   }
-}
-
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
 });
+process.stdin.on('end', () => process.exit(0));
